@@ -2,11 +2,13 @@
 package migrate
 
 import (
-	"github.com/globalsign/mgo/bson"
+	"context"
 	"log"
 	"time"
 
-	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type versionRecord struct {
@@ -26,13 +28,13 @@ const AllAvailable = -1
 // This document consists migration version, migration description and timestamp.
 // Current database version determined as version in latest added document (biggest "_id") from collection mentioned above.
 type Migrate struct {
-	db                   *mgo.Database
+	db                   *mongo.Database
 	migrations           []Migration
 	migrationsCollection string
 	logger               *log.Logger
 }
 
-func NewMigrate(db *mgo.Database, migrations ...Migration) *Migrate {
+func NewMigrate(db *mongo.Database, migrations ...Migration) *Migrate {
 	internalMigrations := make([]Migration, len(migrations))
 	copy(internalMigrations, migrations)
 	return &Migrate{
@@ -54,7 +56,7 @@ func (m *Migrate) SetLogger(l *log.Logger) {
 }
 
 func (m *Migrate) isCollectionExist(name string) (bool, error) {
-	colls, err := m.db.CollectionNames()
+	colls, err := m.db.ListCollectionNames(context.Background(), bson.D{})
 	if err != nil {
 		return false, err
 	}
@@ -75,11 +77,13 @@ func (m *Migrate) createCollectionIfNotExist(name string) error {
 		return nil
 	}
 	// I had a problem here with bson.D: mongo returned error like "command not found: '0'"
-	return m.db.Run(struct {
+	result := m.db.RunCommand(context.Background(), struct {
 		Create string `bson:"create"`
 	}{
 		Create: name,
 	}, nil)
+
+	return result.Err()
 }
 
 // Version returns current database version and comment.
@@ -89,13 +93,20 @@ func (m *Migrate) Version() (uint64, string, error) {
 	}
 
 	var rec versionRecord
+	opts := options.FindOptions{
+		Sort: bson.M{"_id": -1},
+	}
 	// find record with greatest id (assuming it`s latest also)
-	err := m.db.C(m.migrationsCollection).Find(nil).Sort("-_id").One(&rec)
-	if err == mgo.ErrNotFound {
+	cursor, err := m.db.Collection(m.migrationsCollection).Find(context.Background(), bson.M{}, &opts)
+	if err == mongo.ErrNoDocuments {
 		return 0, "", nil
 	}
 	if err != nil {
 		return 0, "", err
+	}
+	decodeErr := cursor.Decode(&rec)
+	if decodeErr != nil {
+		return 0, "", decodeErr
 	}
 	return rec.Version, rec.Description, nil
 }
@@ -106,11 +117,15 @@ func (m *Migrate) Applied(version uint64) bool {
 		return false
 	}
 	var rec versionRecord
-	err := m.db.C(m.migrationsCollection).Find(bson.M{"version": version}).One(&rec)
-	if err == mgo.ErrNotFound {
+	cursor, err := m.db.Collection(m.migrationsCollection).Find(context.Background(), bson.M{"version": version})
+	if err == mongo.ErrNoDocuments {
 		return false
 	}
 	if err != nil {
+		return false
+	}
+	decodeErr := cursor.Decode(&rec)
+	if decodeErr != nil {
 		return false
 	}
 	return true
@@ -118,11 +133,12 @@ func (m *Migrate) Applied(version uint64) bool {
 
 // SetVersion forcibly changes database version to provided.
 func (m *Migrate) SetVersion(version uint64, description string) error {
-	return m.db.C(m.migrationsCollection).Insert(versionRecord{
+	_, err := m.db.Collection(m.migrationsCollection).InsertOne(context.Background(), versionRecord{
 		Version:     version,
 		Timestamp:   time.Now().UTC(),
 		Description: description,
 	})
+	return err
 }
 
 // Up performs "up" migrations to latest available version.
